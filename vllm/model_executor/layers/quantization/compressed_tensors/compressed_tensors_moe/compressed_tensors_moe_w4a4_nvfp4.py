@@ -172,20 +172,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
-        # NOTE(rob): wN_weight_packed -> wN_weight is because ModularKernelMethod
-        # requires this naming convention. However, the name change breaks
-        # reloading because the state dict no longer matches disk. Once we
-        # remove MKM, we should revert this change to ensure compatibility.
-        layer.w13_weight = torch.nn.Parameter(
-            layer.w13_weight_packed.data, requires_grad=False
-        )
-        delattr(layer, "w13_weight_packed")
-
-        layer.w2_weight = torch.nn.Parameter(
-            layer.w2_weight_packed.data, requires_grad=False
-        )
-        delattr(layer, "w2_weight_packed")
-
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
             layer.w13_weight_global_scale[:, 0], layer.w13_weight_global_scale[:, 1]
@@ -209,21 +195,28 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         ) = convert_to_nvfp4_moe_kernel_format(
             nvfp4_backend=self.nvfp4_backend,
             layer=layer,
-            w13=layer.w13_weight,
+            w13=layer.w13_weight_packed,
             w13_scale=layer.w13_weight_scale,
             w13_scale_2=(1.0 / w13_weight_global_scale),
             a13_scale=(1.0 / layer.w13_input_global_scale),
-            w2=layer.w2_weight,
+            w2=layer.w2_weight_packed,
             w2_scale=layer.w2_weight_scale,
             w2_scale_2=(1.0 / layer.w2_weight_global_scale),
             a2_scale=(1.0 / layer.w2_input_global_scale),
             is_act_and_mul=self.moe.is_act_and_mul,
         )
 
-        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w13_weight_packed", w13)
         replace_parameter(layer, "w13_weight_scale", w13_scale)
-        replace_parameter(layer, "w2_weight", w2)
+        replace_parameter(layer, "w2_weight_packed", w2)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
+
+        # ModularKernelMethod expects the unpacked runtime names. Keep the
+        # checkpoint-facing names registered so state-dict reload and CPU
+        # offload can continue tracking them through post-load repacking, and
+        # expose aliases without registering duplicate parameters.
+        object.__setattr__(layer, "w13_weight", layer.w13_weight_packed)
+        object.__setattr__(layer, "w2_weight", layer.w2_weight_packed)
         layer.w13_weight_scale_2 = w13_scale_2
         layer.w2_weight_scale_2 = w2_scale_2
         layer.w13_input_scale = a13_scale
