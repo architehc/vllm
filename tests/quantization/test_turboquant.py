@@ -210,6 +210,18 @@ class TestTurboQuantConfig:
         layers = TurboQuantConfig.get_boundary_skip_layers(mc, 10)
         assert len(layers) == 8
 
+    @pytest.mark.parametrize(
+        ("preset", "expected"),
+        [
+            ("turboquant_k8v4", False),
+            ("turboquant_4bit_nc", False),
+            ("turboquant_k3v4_nc", True),
+            ("turboquant_3bit_nc", True),
+        ],
+    )
+    def test_boundary_protection_policy(self, preset, expected):
+        assert TurboQuantConfig.requires_boundary_protection(preset) is expected
+
 
 class TestHybridAttentionIndices:
     """Regression tests for boundary protection on hybrid models.

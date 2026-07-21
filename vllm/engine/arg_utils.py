@@ -1719,7 +1719,13 @@ class EngineArgs:
                 TurboQuantConfig,
             )
 
-            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
+            boundary = (
+                TurboQuantConfig.get_boundary_skip_layers(model_config)
+                if TurboQuantConfig.requires_boundary_protection(
+                    resolved_cache_dtype
+                )
+                else []
+            )
             existing = set(cache_config.kv_cache_dtype_skip_layers)
             cache_config.kv_cache_dtype_skip_layers = sorted(
                 existing | set(boundary), key=int

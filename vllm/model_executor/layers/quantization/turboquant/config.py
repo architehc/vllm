@@ -40,6 +40,13 @@ TQ_PRESETS: dict[str, dict] = {
     },
 }
 
+# Boundary layers are kept in the model dtype only for the aggressive 3-bit
+# key presets. The 4-bit preset does not need this protection, and retaining
+# four BF16 layers prevents native 256K context from fitting on 24 GiB GPUs.
+TQ_BOUNDARY_PROTECTED_PRESETS = frozenset(
+    {"turboquant_k3v4_nc", "turboquant_3bit_nc"}
+)
+
 
 @dataclass
 class TurboQuantConfig:
@@ -204,6 +211,11 @@ class TurboQuantConfig:
         # Deduplicate (if num_layers <= 2*n)
         indices = sorted(set(first + last))
         return [str(i) for i in indices]
+
+    @staticmethod
+    def requires_boundary_protection(cache_dtype: str) -> bool:
+        """Whether a preset should retain boundary layers at model dtype."""
+        return cache_dtype in TQ_BOUNDARY_PROTECTED_PRESETS
 
     @staticmethod
     def from_cache_dtype(cache_dtype: str, head_dim: int) -> TurboQuantConfig:
