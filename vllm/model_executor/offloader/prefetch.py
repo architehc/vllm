@@ -17,7 +17,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-# Import prefetch_ops to register custom ops at module load time
+import vllm.envs as envs
 import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import BaseOffloader, should_pin_memory
@@ -137,6 +137,83 @@ class StaticBufferPool:
         return self._buffers[key][slot_idx % self.slot_capacity]
 
 
+class _PinnedStagingPool:
+    """Bounded pinned-CPU buffers used between pageable storage and the GPU.
+
+    The pool mirrors :class:`StaticBufferPool`: each prefetch slot has one
+    pinned tensor per unique parameter layout. Canonical weights remain in
+    pageable memory, so pinned memory is bounded by ``slot_capacity`` rather
+    than growing with the number of offloaded layers.
+
+    A slot cannot be refilled until its prior H2D transfer has completed. CUDA
+    may continue reading pinned host memory after ``Tensor.copy_`` returns, so
+    each slot owns an event that is synchronized before the slot is reused.
+    """
+
+    def __init__(self, param_infos: list[ParamInfo], slot_capacity: int):
+        self.slot_capacity = slot_capacity
+        self.total_bytes = 0
+
+        unique_params: dict[tuple, ParamInfo] = {}
+        for info in param_infos:
+            if info.key not in unique_params:
+                unique_params[info.key] = info
+
+        self._buffers: dict[tuple, list[torch.Tensor]] = {}
+        for key, info in unique_params.items():
+            slot_tensors = []
+            for _ in range(slot_capacity):
+                buf = torch.empty_strided(
+                    size=info.shape,
+                    stride=info.stride,
+                    dtype=info.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                slot_tensors.append(buf)
+                self.total_bytes += info.num_bytes
+            self._buffers[key] = slot_tensors
+
+        self._slot_done_events = [torch.cuda.Event() for _ in range(self.slot_capacity)]
+        self._slot_in_flight = [False] * self.slot_capacity
+
+        logger.debug(
+            "[_PinnedStagingPool] Allocated %d unique "
+            "(name, shape, stride, dtype), %d slots each, total %.4f GB",
+            len(unique_params),
+            slot_capacity,
+            self.total_bytes / 1e9,
+        )
+
+    def get_buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        stride: tuple[int, ...],
+        dtype: torch.dtype,
+        slot_idx: int,
+    ) -> torch.Tensor:
+        """Return a pinned staging tensor for a parameter and slot."""
+        key = (name, shape, stride, dtype)
+        return self._buffers[key][slot_idx % self.slot_capacity]
+
+    def wait_until_available(self, slot_idx: int) -> None:
+        """Wait on the host before overwriting a slot used by an H2D DMA."""
+        slot_idx %= self.slot_capacity
+        if self._slot_in_flight[slot_idx]:
+            self._slot_done_events[slot_idx].synchronize()
+            self._slot_in_flight[slot_idx] = False
+
+    def record_h2d(self, slot_idx: int, stream: torch.cuda.Stream) -> None:
+        """Protect a slot until all preceding H2D work on ``stream`` ends."""
+        slot_idx %= self.slot_capacity
+        assert not self._slot_in_flight[slot_idx], (
+            "Pinned staging slot was reused without waiting for its prior H2D copy"
+        )
+        self._slot_done_events[slot_idx].record(stream)
+        self._slot_in_flight[slot_idx] = True
+
+
 class PrefetchOffloader(BaseOffloader):
     """Prefetching-based offloader with group-based layer selection.
 
@@ -149,6 +226,8 @@ class PrefetchOffloader(BaseOffloader):
         num_in_group: Offload this many layers per group (last N of each group).
         prefetch_step: Number of layers to prefetch ahead.
         mode: Offload mode ("cpu" is currently supported).
+        use_pinned_staging: Keep canonical weights pageable and use a bounded
+            pinned ring for H2D transfers. This mode is eager-only.
     """
 
     def __init__(
@@ -158,12 +237,18 @@ class PrefetchOffloader(BaseOffloader):
         prefetch_step: int,
         offload_params: set[str] | None = None,
         mode: str = "cpu",
+        use_pinned_staging: bool | None = None,
     ):
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step
         self.offload_params = offload_params or set()
         self.mode = mode
+        self.use_pinned_staging = (
+            envs.VLLM_WEIGHT_OFFLOADING_USE_PINNED_STAGING
+            if use_pinned_staging is None
+            else use_pinned_staging
+        )
 
         # Copy stream for async H2D transfers
         self.copy_stream = torch.cuda.Stream()
@@ -171,6 +256,7 @@ class PrefetchOffloader(BaseOffloader):
         # Module offloaders and buffer pool (populated in wrap_modules/post_init)
         self.module_offloaders: list[_ModuleOffloader] = []
         self.buffer_pool: StaticBufferPool | None = None
+        self.staging_pool: _PinnedStagingPool | None = None
         self.total_offloaded_bytes = 0
 
     def wrap_modules(
@@ -211,6 +297,7 @@ class PrefetchOffloader(BaseOffloader):
                         copy_stream=self.copy_stream,
                         whitelist_param_names=whitelist,
                         layer_idx=len(self.module_offloaders),
+                        use_pinned_staging=self.use_pinned_staging,
                     )
                 )
 
@@ -371,21 +458,43 @@ class PrefetchOffloader(BaseOffloader):
             slot_capacity=self.prefetch_step,
             device=device,
         )
+        if self.use_pinned_staging:
+            try:
+                self.staging_pool = _PinnedStagingPool(
+                    param_infos=param_infos,
+                    slot_capacity=self.prefetch_step,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Pinned staging was requested but pinned CPU memory could not "
+                    "be allocated. Disable "
+                    "VLLM_WEIGHT_OFFLOADING_USE_PINNED_STAGING or check the "
+                    "platform's CUDA pinned-memory support."
+                ) from exc
 
         # Assign buffer slots and point parameters to GPU buffers
         for idx, offloader in enumerate(self.module_offloaders):
             slot_idx = idx % self.prefetch_step
-            offloader.assign_buffer_slot(self.buffer_pool, slot_idx)
+            offloader.assign_buffer_slot(
+                self.buffer_pool, slot_idx, staging_pool=self.staging_pool
+            )
 
         # Collect offloaded bytes
         for offloader in self.module_offloaders:
             offloader.post_init()
             self.total_offloaded_bytes += offloader.offloaded_bytes
 
+        staging_summary = (
+            f", pinned staging pool: {self.staging_pool.total_bytes / 1e9:.4f} GB "
+            "(eager-only)"
+            if self.staging_pool is not None
+            else ""
+        )
         logger.info_once(
             f"[PrefetchOffloader] Initialized {len(self.module_offloaders)} modules. "
             f"Total GPU memory saved: {self.total_offloaded_bytes / 1e9:.4f} GB, "
-            f"Static buffer pool: {self.buffer_pool.total_bytes / 1e9:.4f} GB "
+            f"Static buffer pool: {self.buffer_pool.total_bytes / 1e9:.4f} GB"
+            f"{staging_summary} "
             f"(group_size={self.group_size}, num_in_group={self.num_in_group}, "
             f"prefetch_step={self.prefetch_step}, mode={self.mode})"
         )
@@ -408,6 +517,7 @@ class _ModuleOffloader:
         copy_stream: torch.cuda.Stream,
         whitelist_param_names: list[str],
         layer_idx: int,
+        use_pinned_staging: bool = False,
     ):
         self.mode = mode
         self.module = module
@@ -441,6 +551,7 @@ class _ModuleOffloader:
         # Buffer pool and slot (assigned in assign_buffer_slot)
         self._buffer_pool: StaticBufferPool | None = None
         self._buffer_slot_idx: int = 0
+        self._staging_pool: _PinnedStagingPool | None = None
 
         param_dict = dict(self.module.named_parameters())
         assert all(name in param_dict for name in whitelist_param_names), (
@@ -449,7 +560,12 @@ class _ModuleOffloader:
         )
 
         self._param_offloaders = {
-            name: _BaseParamOffloader.create(mode, module=module, param_name=name)
+            name: _BaseParamOffloader.create(
+                mode,
+                module=module,
+                param_name=name,
+                pin_cpu_storage=False if use_pinned_staging else None,
+            )
             for name in whitelist_param_names
         }
 
@@ -510,7 +626,12 @@ class _ModuleOffloader:
             )
         return infos
 
-    def assign_buffer_slot(self, pool: StaticBufferPool, slot_idx: int):
+    def assign_buffer_slot(
+        self,
+        pool: StaticBufferPool,
+        slot_idx: int,
+        staging_pool: _PinnedStagingPool | None = None,
+    ):
         """Assign this module to a buffer slot in the pool.
 
         Also assigns static GPU buffers to each parameter offloader,
@@ -518,6 +639,7 @@ class _ModuleOffloader:
         """
         self._buffer_pool = pool
         self._buffer_slot_idx = slot_idx
+        self._staging_pool = staging_pool
 
         # Assign static buffers to parameters
         # Use CPU storage shape/stride/dtype since param.data is now empty
@@ -548,6 +670,18 @@ class _ModuleOffloader:
 
         # Track if this prefetch is being captured (for _wait_for_layer logic)
         self._prefetch_in_capture = torch.cuda.is_current_stream_capturing()
+        if self._staging_pool is not None and self._prefetch_in_capture:
+            raise RuntimeError(
+                "Bounded pinned staging cannot be replayed safely with CUDA "
+                "graphs because staging slots are shared by multiple layers. "
+                "Use --enforce-eager or disable "
+                "VLLM_WEIGHT_OFFLOADING_USE_PINNED_STAGING."
+            )
+
+        if self._staging_pool is not None:
+            # CUDA may still be reading this host slot after an asynchronous
+            # copy call returns. Do not refill it until its prior DMA ends.
+            self._staging_pool.wait_until_available(self._buffer_slot_idx)
 
         # Fork: record event on compute stream, copy_stream waits on it
         # This joins copy_stream to any active CUDA graph capture
@@ -561,13 +695,31 @@ class _ModuleOffloader:
                 gpu_buffer = offloader._gpu_buffer
                 assert cpu_storage is not None, "CPU storage not initialized"
                 assert gpu_buffer is not None, "GPU buffer not assigned"
-                assert not should_pin_memory() or cpu_storage.is_pinned(), (
-                    f"CPU storage for {name} is not pinned! "
+                h2d_source = cpu_storage
+                if self._staging_pool is not None:
+                    h2d_source = self._staging_pool.get_buffer(
+                        name=name,
+                        shape=tuple(cpu_storage.shape),
+                        stride=tuple(cpu_storage.stride()),
+                        dtype=cpu_storage.dtype,
+                        slot_idx=self._buffer_slot_idx,
+                    )
+                    # Pageable -> pinned is a synchronous host copy. It can
+                    # overlap GPU work already enqueued on the compute stream.
+                    h2d_source.copy_(cpu_storage)
+                needs_pinned_source = (
+                    self._staging_pool is not None or should_pin_memory()
+                )
+                assert not needs_pinned_source or h2d_source.is_pinned(), (
+                    f"H2D source for {name} is not pinned! "
                     "non_blocking=True H2D copy from non-pinned memory "
                     "causes stream synchronization that breaks "
                     "event-based fork synchronization."
                 )
-                gpu_buffer.copy_(cpu_storage, non_blocking=True)
+                gpu_buffer.copy_(h2d_source, non_blocking=True)
+
+        if self._staging_pool is not None:
+            self._staging_pool.record_h2d(self._buffer_slot_idx, self.copy_stream)
 
         # Record completion event for _wait_for_layer to use
         self._copy_done_event.record(self.copy_stream)
@@ -632,7 +784,7 @@ class _BaseParamOffloader(ABC):
 
 
 class _CpuParamOffloader(_BaseParamOffloader):
-    """Offload parameter to pinned CPU memory.
+    """Offload a parameter to CPU memory under the configured pinning policy.
 
     Uses GPU static buffers as the actual parameter, with CPU storage
     kept separately. This ensures torch.compile sees GPU tensors at trace time.
@@ -642,8 +794,16 @@ class _CpuParamOffloader(_BaseParamOffloader):
     2. assign_static_buffer() - points param.data to GPU static buffer
     """
 
-    def __init__(self, module: nn.Module, param_name: str):
+    def __init__(
+        self,
+        module: nn.Module,
+        param_name: str,
+        pin_cpu_storage: bool | None = None,
+    ):
         super().__init__(module, param_name)
+        self._pin_cpu_storage = (
+            should_pin_memory() if pin_cpu_storage is None else pin_cpu_storage
+        )
         self._cpu_storage: torch.Tensor | None = None
         self._gpu_buffer: torch.Tensor | None = None  # Store reference to GPU buffer
         # Set to True if the underlying nn.Parameter was deleted by
@@ -656,15 +816,13 @@ class _CpuParamOffloader(_BaseParamOffloader):
         self._offload_to_cpu_internal()
 
     def _offload_to_cpu_internal(self):
-        """Copy parameter data to pinned CPU storage and free GPU memory.
+        """Copy parameter data to CPU storage and free GPU memory.
 
         This replaces param.data with CPU storage, allowing weight loading
         to continue writing to CPU memory. GPU memory is freed when the
         original GPU tensor is garbage collected.
         """
         param = self._param
-        pin_memory = should_pin_memory()
-
         # Create pinned CPU storage and copy current GPU data
         self._cpu_storage = torch.empty_strided(
             size=param.data.size(),
@@ -672,7 +830,7 @@ class _CpuParamOffloader(_BaseParamOffloader):
             dtype=param.data.dtype,
             layout=param.data.layout,
             device="cpu",
-            pin_memory=pin_memory,
+            pin_memory=self._pin_cpu_storage,
         )
         self._cpu_storage.copy_(param.data)
 
@@ -685,7 +843,7 @@ class _CpuParamOffloader(_BaseParamOffloader):
         param.data = self._cpu_storage
 
     def _update_cpu_storage_from_param(self) -> None:
-        """Update _cpu_storage from current param.data, ensuring pinned memory.
+        """Update _cpu_storage using the configured CPU pinning policy.
 
         After process_weights_after_loading, device_loading_context creates
         non-pinned CPU tensors via `p.data = p.data.to("cpu")`. Using
@@ -694,13 +852,13 @@ class _CpuParamOffloader(_BaseParamOffloader):
         event-based fork synchronization and potentially allowing the copy
         to overwrite the GPU buffer while the compute stream still reads it.
 
-        This method ensures _cpu_storage always uses pinned memory when
-        available, re-pinning if necessary.
+        This method re-pins storage when the configured policy requests it.
+        Bounded staging explicitly keeps this canonical copy pageable.
         """
         param = self._param
 
         if param.data.device.type == "cpu":
-            if should_pin_memory() and not param.data.is_pinned():
+            if self._pin_cpu_storage and not param.data.is_pinned():
                 pinned = torch.empty_strided(
                     size=param.data.size(),
                     stride=param.data.stride(),

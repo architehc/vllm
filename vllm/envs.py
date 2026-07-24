@@ -252,6 +252,7 @@ if TYPE_CHECKING:
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+    VLLM_WEIGHT_OFFLOADING_USE_PINNED_STAGING: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
@@ -1727,6 +1728,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
+    ),
+    # Keep canonical prefetch-offloaded weights pageable and use a bounded
+    # pinned staging ring for asynchronous H2D copies. This mode is eager-only.
+    "VLLM_WEIGHT_OFFLOADING_USE_PINNED_STAGING": lambda: bool(
+        int(os.getenv("VLLM_WEIGHT_OFFLOADING_USE_PINNED_STAGING", "0"))
     ),
     # Disable using UVA (Unified Virtual Addressing) for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": lambda: bool(
