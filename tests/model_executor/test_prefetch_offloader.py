@@ -66,9 +66,7 @@ class _FakeTensor:
         (5, 1),
     ],
 )
-def test_prefetch_static_slot_schedule_accepts_safe_counts(
-    num_modules, prefetch_step
-):
+def test_prefetch_static_slot_schedule_accepts_safe_counts(num_modules, prefetch_step):
     offloader = object.__new__(PrefetchOffloader)
     offloader.module_offloaders = [object()] * num_modules
     offloader.prefetch_step = prefetch_step
@@ -98,6 +96,121 @@ def test_prefetch_static_slot_schedule_rejected_before_post_init_work():
         offloader.post_init()
 
     assert sync_calls == 0
+
+
+def test_prefetch_slot_owner_is_published_only_after_enqueue():
+    log: list[tuple[str, object]] = []
+    offloader = object.__new__(PrefetchOffloader)
+    offloader._slot_owners = [0, 1]
+
+    class FakeModuleOffloader:
+        def __init__(self, layer_idx: int):
+            self.layer_idx = layer_idx
+            self._buffer_slot_idx = layer_idx % 2
+            self._prefetch_required = layer_idx >= 2
+
+        def start_onload_to_static(self):
+            log.append(("enqueue", self.layer_idx))
+            log.append(("owners_during_enqueue", tuple(offloader._slot_owners)))
+            log.append(
+                (
+                    "required_during_enqueue",
+                    tuple(
+                        entry._prefetch_required
+                        for entry in offloader.module_offloaders
+                    ),
+                )
+            )
+            self._prefetch_required = False
+
+    offloader.module_offloaders = [FakeModuleOffloader(i) for i in range(4)]
+
+    offloader._start_prefetch(2)
+
+    assert log == [
+        ("enqueue", 2),
+        ("owners_during_enqueue", (None, 1)),
+        ("required_during_enqueue", (True, False, True, True)),
+    ]
+    assert offloader._slot_owners == [2, 1]
+    assert offloader.module_offloaders[0]._prefetch_required
+    assert not offloader.module_offloaders[2]._prefetch_required
+
+
+def test_partial_traversal_reprimes_stale_slot_on_next_invocation(monkeypatch):
+    calls: list[tuple[str, int]] = []
+    modules = [torch.nn.Identity() for _ in range(4)]
+    offloader = object.__new__(PrefetchOffloader)
+    offloader.offload_params = set()
+    offloader.prefetch_step = 2
+    offloader._slot_owners = [0, 1]
+
+    class FakeModuleOffloader:
+        def __init__(self, layer_idx: int):
+            self.module = modules[layer_idx]
+            self._buffer_slot_idx = layer_idx % 2
+            self._prefetch_required = layer_idx >= 2
+
+        def start_onload_to_static(self):
+            self._prefetch_required = False
+
+    offloader.module_offloaders = [FakeModuleOffloader(i) for i in range(4)]
+
+    def start_prefetch(_tensor: torch.Tensor, index: int):
+        calls.append(("start", index))
+        offloader._start_prefetch(index)
+
+    def wait_prefetch(_tensor: torch.Tensor, index: int):
+        calls.append(("wait", index))
+
+    monkeypatch.setattr(torch.ops.vllm, "start_prefetch", start_prefetch)
+    monkeypatch.setattr(torch.ops.vllm, "wait_prefetch", wait_prefetch)
+    offloader._hook_module_forward(0, modules[0])
+
+    # Stop after module 0: its lookahead overwrites slot 0 with module 2,
+    # without reaching the circular tail that would normally restore module 0.
+    modules[0](torch.zeros(1, 2))
+    assert calls == [("wait", 0), ("start", 2)]
+    assert offloader._slot_owners == [2, 1]
+
+    calls.clear()
+    modules[0](torch.zeros(1, 2))
+
+    # The next invocation must restore module 0 before waiting/using the slot.
+    assert calls == [("start", 0), ("wait", 0), ("start", 2)]
+
+
+def test_wait_prefetch_defensively_reprimes_stale_slot(monkeypatch):
+    calls: list[tuple[str, int]] = []
+    offloader = object.__new__(PrefetchOffloader)
+    offloader._slot_owners = [2, 1]
+    offloader.copy_stream = object()
+
+    class FakeModuleOffloader:
+        def __init__(self, layer_idx: int):
+            self.layer_idx = layer_idx
+            self._buffer_slot_idx = layer_idx % 2
+            self._prefetch_required = False
+            self._event_valid_for_eager = True
+            self._copy_done_event = object()
+
+        def start_onload_to_static(self):
+            calls.append(("start", self.layer_idx))
+            self._prefetch_required = False
+
+    class FakeCurrentStream:
+        def wait_event(self, _event):
+            calls.append(("wait", 0))
+
+    offloader.module_offloaders = [FakeModuleOffloader(i) for i in range(4)]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: FakeCurrentStream())
+
+    offloader._wait_for_layer(0)
+
+    assert calls == [("start", 0), ("wait", 0)]
+    assert offloader._slot_owners == [0, 1]
+    assert offloader.module_offloaders[2]._prefetch_required
 
 
 def test_pinned_staging_pool_allocates_once_per_key_and_slot(monkeypatch):

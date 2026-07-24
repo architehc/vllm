@@ -257,6 +257,11 @@ class PrefetchOffloader(BaseOffloader):
         self.module_offloaders: list[_ModuleOffloader] = []
         self.buffer_pool: StaticBufferPool | None = None
         self.staging_pool: _PinnedStagingPool | None = None
+        # Authoritative owner of every shared static-buffer slot. Per-module
+        # prefetch flags are not sufficient because a later module can
+        # overwrite the same slot before an interrupted traversal reaches the
+        # circular tail that normally re-primes the first modules.
+        self._slot_owners: list[int | None] = []
         self.total_offloaded_bytes = 0
 
     def wrap_modules(
@@ -338,10 +343,13 @@ class PrefetchOffloader(BaseOffloader):
             )
             if not bypass_current:
                 current_offloader = self.module_offloaders[index]
-                if current_offloader._prefetch_required:
+                if current_offloader._prefetch_required or not self._owns_static_slot(
+                    index
+                ):
                     # A prior decode-only invocation may have deliberately
-                    # skipped this copy. Re-prime before a later prefill uses
-                    # the shared static slot again.
+                    # skipped this copy, or an interrupted traversal may have
+                    # left another module in this shared slot. Re-prime before
+                    # a later prefill uses it again.
                     torch.ops.vllm.start_prefetch(input_tensor, index)
                 torch.ops.vllm.wait_prefetch(input_tensor, index)
 
@@ -386,6 +394,13 @@ class PrefetchOffloader(BaseOffloader):
         """
         offloader = self.module_offloaders[layer_idx]
 
+        # Keep the custom-op implementation defensive as well as the Python
+        # forward hook. This is the authoritative check for callers that reach
+        # wait_prefetch without executing the hook-side branch (for example,
+        # after a partial traversal or compiled wrapper transition).
+        if offloader._prefetch_required or not self._owns_static_slot(layer_idx):
+            self._start_prefetch(layer_idx)
+
         if torch.cuda.is_current_stream_capturing():
             # During capture, skip wait for pre-capture prefetches.
             # sync_before_graph_capture() ensures pre-capture work is complete.
@@ -417,7 +432,38 @@ class PrefetchOffloader(BaseOffloader):
     def _start_prefetch(self, layer_idx: int):
         """Called by custom op - start async copy to static buffer."""
         offloader = self.module_offloaders[layer_idx]
+
+        slot_owners = getattr(self, "_slot_owners", None)
+        slot_idx: int | None = None
+        if slot_owners:
+            slot_idx = offloader._buffer_slot_idx % len(slot_owners)
+            prior_owner = slot_owners[slot_idx]
+            # Invalidate the old owner before any overwrite can be enqueued.
+            # Clear the owner while the copy is being prepared so a failed
+            # enqueue cannot leave the slot advertised as valid.
+            if prior_owner is not None:
+                self.module_offloaders[prior_owner]._prefetch_required = True
+            offloader._prefetch_required = True
+            slot_owners[slot_idx] = None
+
         offloader.start_onload_to_static()
+
+        # start_onload_to_static returns only after the H2D and completion
+        # event have been enqueued. Publish ownership no earlier than that.
+        if slot_idx is not None:
+            slot_owners[slot_idx] = layer_idx
+
+    def _owns_static_slot(self, layer_idx: int) -> bool:
+        """Return whether the shared GPU slot currently contains this layer."""
+        slot_owners = getattr(self, "_slot_owners", None)
+        if not slot_owners:
+            # Hooks are installed before post_init allocates the slot table.
+            # No model forward is expected in that interval; retain the legacy
+            # per-module flag behavior for lightweight test doubles as well.
+            return not self.module_offloaders[layer_idx]._prefetch_required
+        offloader = self.module_offloaders[layer_idx]
+        slot_idx = offloader._buffer_slot_idx % len(slot_owners)
+        return slot_owners[slot_idx] == layer_idx
 
     def join_after_forward(self):
         """Join copy_stream after model forward completes.
@@ -499,6 +545,10 @@ class PrefetchOffloader(BaseOffloader):
                 self.buffer_pool, slot_idx, staging_pool=self.staging_pool
             )
 
+        # Ownership starts empty and is published by the initial prefetches
+        # only after their H2D copies have been enqueued.
+        self._slot_owners = [None] * self.prefetch_step
+
         # Collect offloaded bytes
         for offloader in self.module_offloaders:
             offloader.post_init()
@@ -521,7 +571,7 @@ class PrefetchOffloader(BaseOffloader):
 
         # Start initial prefetches
         for i in range(min(self.prefetch_step, len(self.module_offloaders))):
-            self.module_offloaders[i].start_onload_to_static()
+            self._start_prefetch(i)
 
 
 class _ModuleOffloader:
