@@ -7,7 +7,10 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.model_executor.models.hy_v3_kt_decode import _parse_index_spec
+from vllm.model_executor.models.hy_v3_kt_decode import (
+    HYV3KTDecode,
+    _parse_index_spec,
+)
 from vllm.model_executor.offloader.prefetch import (
     PrefetchOffloader,
     _bypasses_expert_prefetch,
@@ -33,6 +36,10 @@ def test_reject_invalid_kt_layer_spec(spec: str):
 
 
 class _DecodeOnlyModule(nn.Module):
+    def __init__(self, max_tokens: int = 1):
+        super().__init__()
+        self.max_tokens = max_tokens
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -49,17 +56,34 @@ class _DecodeOnlyModule(nn.Module):
         residual: torch.Tensor | None,
     ) -> bool:
         del positions, residual
-        return hidden_states.shape[0] == 1
+        return hidden_states.shape[0] <= self.max_tokens
+
+
+def test_kt_low_token_threshold():
+    adapter = object.__new__(HYV3KTDecode)
+    adapter.enabled = True
+    adapter.settings = SimpleNamespace(max_tokens=16)
+
+    assert adapter.should_use(torch.zeros(1, 16))
+    assert adapter.should_use(torch.zeros(16, 16))
+    assert not adapter.should_use(torch.zeros(17, 16))
+
+    adapter.enabled = False
+    assert not adapter.should_use(torch.zeros(1, 16))
 
 
 def test_prefetch_bypass_is_decode_and_expert_only():
-    module = _DecodeOnlyModule()
+    module = _DecodeOnlyModule(max_tokens=16)
     positions = torch.zeros(1, dtype=torch.int64)
     decode_hidden = torch.zeros(1, 16)
-    prefill_hidden = torch.zeros(2, 16)
+    cached_tail_hidden = torch.zeros(16, 16)
+    prefill_hidden = torch.zeros(17, 16)
 
     assert _bypasses_expert_prefetch(
         {"experts"}, module, positions, decode_hidden, None
+    )
+    assert _bypasses_expert_prefetch(
+        {"experts"}, module, positions, cached_tail_hidden, None
     )
     assert not _bypasses_expert_prefetch(
         {"experts"}, module, positions, prefill_hidden, None

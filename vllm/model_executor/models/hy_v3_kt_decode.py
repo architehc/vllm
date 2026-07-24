@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Opt-in KTransformers decode path for HY-V3 routed experts.
+"""Opt-in KTransformers low-token path for HY-V3 routed experts.
 
-The adapter is intentionally narrow: one-token MoE invocations can run the
-routed experts on the CPU while the tensor-parallel shared expert remains on
-the GPUs. Multi-token invocations continue to use vLLM's normal GPU MoE path.
+Small MoE invocations can run the routed experts on the CPU while the
+tensor-parallel shared expert remains on the GPUs. Larger invocations continue
+to use vLLM's normal GPU MoE path. The default threshold is one token; raising
+it is useful for the uncached tail of a radix-cache hit.
 """
 
 from __future__ import annotations
@@ -133,6 +134,7 @@ class HYV3KTDecodeSettings:
     numa_nodes: tuple[int, ...] | None
     cpu_set: frozenset[int] | None
     queue_cpu: int | None
+    max_tokens: int
 
     @classmethod
     def from_env(
@@ -177,6 +179,7 @@ class HYV3KTDecodeSettings:
             ),
             cpu_set=_parse_cpu_set(cpu_set_spec) if cpu_set_spec else None,
             queue_cpu=queue_cpu,
+            max_tokens=_env_int("VLLM_HYV3_KT_MAX_TOKENS", 1),
         )
 
 
@@ -215,7 +218,7 @@ def _load_kt_kernel(package_dir: str | None) -> ModuleType:
 
 
 class HYV3KTDecode:
-    """Run one-token HY-V3 routed experts through KT's NVFP4 CPU kernel."""
+    """Run small HY-V3 routed-expert batches through KT's NVFP4 CPU kernel."""
 
     def __init__(
         self,
@@ -267,7 +270,7 @@ class HYV3KTDecode:
             )
 
     def should_use(self, hidden_states: torch.Tensor) -> bool:
-        return self.enabled and hidden_states.shape[0] == 1
+        return self.enabled and 0 < hidden_states.shape[0] <= self.settings.max_tokens
 
     def prepare(self) -> None:
         """Load selected CPU weights before the first distributed forward."""
@@ -294,7 +297,8 @@ class HYV3KTDecode:
                 return self._wrapper
             self._configure_cpu_runtime()
             kt_kernel = _load_kt_kernel(self.settings.package_dir)
-            kt_kernel.KTMoEWrapper.set_capture_batch_sizes([1])
+            capture_batch_sizes = sorted({1, self.settings.max_tokens})
+            kt_kernel.KTMoEWrapper.set_capture_batch_sizes(capture_batch_sizes)
             wrapper = kt_kernel.KTMoEWrapper(
                 layer_idx=self.layer_idx,
                 num_experts=self.num_experts,
@@ -310,7 +314,7 @@ class HYV3KTDecode:
                     else None
                 ),
                 weight_path=self.settings.weight_path,
-                chunked_prefill_size=1,
+                chunked_prefill_size=self.settings.max_tokens,
                 method="NVFP4",
             )
             physical_to_logical = torch.arange(
@@ -319,11 +323,12 @@ class HYV3KTDecode:
             wrapper.load_weights(physical_to_logical)
             self._wrapper = wrapper
             logger.info(
-                "Loaded HY-V3 KT NVFP4 decode layer %d on TP rank 0 "
-                "(%d threads, %d pools)",
+                "Loaded HY-V3 KT NVFP4 low-token layer %d on TP rank 0 "
+                "(%d threads, %d pools, max_tokens=%d)",
                 self.layer_idx,
                 self.settings.cpu_threads,
                 self.settings.threadpool_count,
+                self.settings.max_tokens,
             )
         return self._wrapper
 
