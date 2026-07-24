@@ -301,10 +301,26 @@ class PrefetchOffloader(BaseOffloader):
                     )
                 )
 
+        self._validate_static_slot_schedule()
+
         for index, module in enumerate(offload_modules):
             self._hook_module_forward(index, module)
 
         return all_modules
+
+    def _validate_static_slot_schedule(self) -> None:
+        """Ensure circular prefetching always reuses the current layer's slot."""
+        num_modules = len(self.module_offloaders)
+        if num_modules and (
+            self.prefetch_step <= 0 or num_modules % self.prefetch_step != 0
+        ):
+            raise ValueError(
+                "Invalid prefetch offload schedule: "
+                f"{num_modules} offloaded modules cannot use "
+                f"prefetch_step={self.prefetch_step}. The number of offloaded "
+                "modules must be divisible by prefetch_step so circular "
+                "prefetching cannot overwrite a live static-buffer slot."
+            )
 
     def _hook_module_forward(self, index: int, module: nn.Module):
         """Hook module's forward with torch.compile-compatible sync."""
@@ -431,6 +447,10 @@ class PrefetchOffloader(BaseOffloader):
         (in _CpuParamOffloader.__init__), so GPU memory is available for the
         static buffer pool.
         """
+        # Validate again at the allocation boundary in case callers populate
+        # module_offloaders without going through wrap_modules().
+        self._validate_static_slot_schedule()
+
         # Sync CPU storage with current param.data BEFORE collecting param info.
         # This is needed because process_weights_after_loading may have:
         # 1. Transformed weights (quantization, transpose, etc.)

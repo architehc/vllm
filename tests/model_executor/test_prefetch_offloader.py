@@ -9,6 +9,7 @@ import torch
 
 from vllm.model_executor.offloader.prefetch import (
     ParamInfo,
+    PrefetchOffloader,
     _CpuParamOffloader,
     _ModuleOffloader,
     _PinnedStagingPool,
@@ -55,6 +56,48 @@ class _FakeTensor:
         if self.log is not None:
             self.log.append(f"copy:{source.name}->{self.name}:{non_blocking}")
         return self
+
+
+@pytest.mark.parametrize(
+    ("num_modules", "prefetch_step"),
+    [
+        (0, 2),
+        (4, 2),
+        (5, 1),
+    ],
+)
+def test_prefetch_static_slot_schedule_accepts_safe_counts(
+    num_modules, prefetch_step
+):
+    offloader = object.__new__(PrefetchOffloader)
+    offloader.module_offloaders = [object()] * num_modules
+    offloader.prefetch_step = prefetch_step
+
+    offloader._validate_static_slot_schedule()
+
+
+def test_prefetch_static_slot_schedule_rejected_before_post_init_work():
+    sync_calls = 0
+
+    class FakeModuleOffloader:
+        def sync_cpu_storage(self):
+            nonlocal sync_calls
+            sync_calls += 1
+
+    offloader = object.__new__(PrefetchOffloader)
+    offloader.module_offloaders = [FakeModuleOffloader() for _ in range(3)]
+    offloader.prefetch_step = 2
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"3 offloaded modules cannot use prefetch_step=2.*"
+            r"must be divisible by prefetch_step"
+        ),
+    ):
+        offloader.post_init()
+
+    assert sync_calls == 0
 
 
 def test_pinned_staging_pool_allocates_once_per_key_and_slot(monkeypatch):
