@@ -198,6 +198,12 @@ class HYV3MultiTokenPredictor(nn.Module):
         )
         return logits
 
+    def prepare_kt_decode(self) -> None:
+        """Load selected MTP routed experts before distributed drafting."""
+        for layer in self.layers.values():
+            if layer.mtp_block.block_type == "moe":
+                layer.mtp_block.mlp.kt_decode.prepare()
+
 
 class HYV3MTP(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -324,6 +330,7 @@ class HYV3MTP(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
                 continue
 
             if "rotary_emb.inv_freq" in name:
@@ -446,6 +453,8 @@ class HYV3MTP(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        self.model.prepare_kt_decode()
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """Rewrite spec layer weight names to match vLLM module structure."""

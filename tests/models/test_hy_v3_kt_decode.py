@@ -11,6 +11,7 @@ from vllm.model_executor.models.hy_v3_kt_decode import (
     HYV3KTDecode,
     _parse_index_spec,
 )
+from vllm.model_executor.models.hy_v3_mtp import HYV3MultiTokenPredictor
 from vllm.model_executor.offloader.prefetch import (
     PrefetchOffloader,
     _bypasses_expert_prefetch,
@@ -70,6 +71,32 @@ def test_kt_low_token_threshold():
 
     adapter.enabled = False
     assert not adapter.should_use(torch.zeros(1, 16))
+
+
+class _PrepareCounter:
+    def __init__(self):
+        self.calls = 0
+
+    def prepare(self):
+        self.calls += 1
+
+
+def test_mtp_prepares_kt_decode_before_drafting():
+    kt_decode = _PrepareCounter()
+    predictor = object.__new__(HYV3MultiTokenPredictor)
+    predictor.layers = {
+        "80": SimpleNamespace(
+            mtp_block=SimpleNamespace(
+                block_type="moe",
+                mlp=SimpleNamespace(kt_decode=kt_decode),
+            )
+        ),
+        "81": SimpleNamespace(mtp_block=SimpleNamespace(block_type="feedforward")),
+    }
+
+    predictor.prepare_kt_decode()
+
+    assert kt_decode.calls == 1
 
 
 def test_prefetch_bypass_is_decode_and_expert_only():

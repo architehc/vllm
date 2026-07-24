@@ -200,7 +200,10 @@ class HYV3MoEFused(nn.Module):
         self.kt_decode = HYV3KTDecode(
             vllm_config=vllm_config,
             layer_idx=layer_idx,
-            num_hidden_layers=config.num_hidden_layers,
+            num_hidden_layers=(
+                config.num_hidden_layers
+                + getattr(config, "num_nextn_predict_layers", 0)
+            ),
             num_experts=config.num_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
