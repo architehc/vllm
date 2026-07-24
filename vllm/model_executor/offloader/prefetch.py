@@ -26,6 +26,19 @@ from vllm.utils.torch_utils import get_dtype_size
 logger = init_logger(__name__)
 
 
+def _bypasses_expert_prefetch(
+    offload_params: set[str], target: nn.Module, *args, **kwargs
+) -> bool:
+    """Return whether a module invocation avoids all offloaded parameters."""
+    # A module may bypass prefetch only when every offloaded parameter belongs
+    # to its experts. Skipping an all-parameter offload would also skip
+    # attention/dense weights and is therefore unsafe.
+    if offload_params != {"experts"}:
+        return False
+    predicate = getattr(target, "should_bypass_offload_prefetch", None)
+    return bool(predicate(*args, **kwargs)) if predicate else False
+
+
 @dataclass
 class ParamInfo:
     """Metadata about an offloaded parameter."""
@@ -217,7 +230,17 @@ class PrefetchOffloader(BaseOffloader):
             # Wait for this layer's prefetch to complete
             # mutates_args on input_tensor creates data dependency for torch.compile
             input_tensor = args[0] if args else kwargs.get("hidden_states")
-            torch.ops.vllm.wait_prefetch(input_tensor, index)
+            bypass_current = _bypasses_expert_prefetch(
+                self.offload_params, module, *args, **kwargs
+            )
+            if not bypass_current:
+                current_offloader = self.module_offloaders[index]
+                if current_offloader._prefetch_required:
+                    # A prior decode-only invocation may have deliberately
+                    # skipped this copy. Re-prime before a later prefill uses
+                    # the shared static slot again.
+                    torch.ops.vllm.start_prefetch(input_tensor, index)
+                torch.ops.vllm.wait_prefetch(input_tensor, index)
 
             # No parameter swapping needed - parameters already point to
             # GPU static buffers (set in assign_static_buffer)
@@ -226,11 +249,18 @@ class PrefetchOffloader(BaseOffloader):
             # Start prefetch for next layer (circular)
             # mutates_args on output_tensor creates ordering dependency
             next_index = (index + self.prefetch_step) % len(self.module_offloaders)
-            # Handle tuple output (e.g., (hidden_states, residual))
-            if isinstance(output, tuple):
-                torch.ops.vllm.start_prefetch(output[0], next_index)
+            next_offloader = self.module_offloaders[next_index]
+            next_module = next_offloader.module
+            if _bypasses_expert_prefetch(
+                self.offload_params, next_module, *args, **kwargs
+            ):
+                next_offloader._prefetch_required = True
             else:
-                torch.ops.vllm.start_prefetch(output, next_index)
+                # Handle tuple output (e.g., (hidden_states, residual))
+                if isinstance(output, tuple):
+                    torch.ops.vllm.start_prefetch(output[0], next_index)
+                else:
+                    torch.ops.vllm.start_prefetch(output, next_index)
 
             # No explicit offload needed - static buffers are reused implicitly
 
@@ -395,6 +425,9 @@ class _ModuleOffloader:
         # cudagraph capture (events become invalid after capture ends).
         # In these cases we fall back to wait_stream.
         self._event_valid_for_eager = False
+        # True means no valid copy for the next invocation is guaranteed.
+        # Decode-only expert bypasses set this when they suppress a copy.
+        self._prefetch_required = True
 
         # Track if last prefetch was started during CUDA graph capture.
         # Used to skip wait_event during capture for pre-capture prefetches.
@@ -541,6 +574,7 @@ class _ModuleOffloader:
         # Event is only valid for eager wait_event if recorded outside capture.
         # Events recorded during capture become invalid after capture ends.
         self._event_valid_for_eager = not torch.cuda.is_current_stream_capturing()
+        self._prefetch_required = False
 
 
 class _BaseParamOffloader(ABC):

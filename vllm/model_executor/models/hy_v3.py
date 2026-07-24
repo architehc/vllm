@@ -64,6 +64,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.hy_v3 import HYV3Config
 
+from .hy_v3_kt_decode import HYV3KTDecode
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -124,6 +125,7 @@ class HYV3MoEFused(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        layer_idx: int = -1,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -195,6 +197,21 @@ class HYV3MoEFused(nn.Module):
             n_shared_experts=config.num_shared_experts,
             shared_experts=self.shared_mlp,
         )
+        self.kt_decode = HYV3KTDecode(
+            vllm_config=vllm_config,
+            layer_idx=layer_idx,
+            num_hidden_layers=config.num_hidden_layers,
+            num_experts=config.num_experts,
+            top_k=top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        if self.kt_decode.enabled and (
+            self.experts.use_ep or self.experts.eplb_state is not None
+        ):
+            raise RuntimeError(
+                "HY-V3 KTransformers decode does not support expert parallelism or EPLB"
+            )
 
     def forward(
         self,
@@ -207,9 +224,21 @@ class HYV3MoEFused(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if self.kt_decode.should_use(hidden_states):
+            topk_weights, topk_ids = self.experts.router.select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+            final_hidden_states = self.kt_decode.forward(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                self.shared_mlp,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
         return final_hidden_states.view(orig_shape)
 
 
@@ -358,9 +387,23 @@ class HYV3DecoderLayer(nn.Module):
             self.block_type = "feedforward"
         else:
             self.mlp = HYV3MoEFused(
-                config=config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+                layer_idx=layer_idx,
             )
             self.block_type = "moe"
+
+    def should_bypass_offload_prefetch(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        idx: int = -1,
+    ) -> bool:
+        """Whether this invocation avoids every offloaded expert parameter."""
+        del positions, residual, idx
+        return self.block_type == "moe" and self.mlp.kt_decode.should_use(hidden_states)
 
     def forward(
         self,
@@ -453,6 +496,11 @@ class HYV3Model(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def prepare_kt_decode(self) -> None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if isinstance(layer, HYV3DecoderLayer) and layer.block_type == "moe":
+                layer.mlp.kt_decode.prepare()
 
     def update_physical_experts_metadata(
         self,
@@ -701,7 +749,9 @@ class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(_filter_weights(weights))
+        loaded_weights = loader.load_weights(_filter_weights(weights))
+        self.model.prepare_kt_decode()
+        return loaded_weights
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
