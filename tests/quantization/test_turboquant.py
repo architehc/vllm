@@ -635,3 +635,97 @@ class TestStoreDecodeRoundTrip:
             assert cos_sim > threshold, (
                 f"Preset {preset} head {h}: cosine_sim={cos_sim:.4f} < {threshold}"
             )
+
+    def test_hy3_gqa_stage1_configs_match_default(self):
+        """Q4-NC stage-1 launch configs agree at Hq32/Hk4/D128."""
+        from vllm.model_executor.layers.quantization.turboquant.centroids import (
+            solve_lloyd_max,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            triton_turboquant_decode_attention,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_store import (
+            triton_turboquant_store,
+        )
+
+        cfg = TurboQuantConfig.from_cache_dtype("turboquant_4bit_nc", head_dim=128)
+        device = torch.device(DEVICE_TYPE)
+        num_tokens, num_query_heads, num_kv_heads, head_dim = 65, 32, 4, 128
+        block_size = 16
+        num_blocks = math.ceil(num_tokens / block_size)
+
+        rotation = _build_hadamard(head_dim, DEVICE_TYPE)
+        centroids, _ = solve_lloyd_max(head_dim, cfg.centroid_bits)
+        centroids = centroids.float().to(device)
+        sorted_centroids, _ = centroids.sort()
+        midpoints = (sorted_centroids[:-1] + sorted_centroids[1:]) / 2
+
+        torch.manual_seed(20260723)
+        key = torch.randn(
+            num_tokens,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float16,
+        )
+        value = torch.randn_like(key)
+        query = torch.randn(
+            1,
+            num_query_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float16,
+        )
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            cfg.slot_size_aligned,
+            device=device,
+            dtype=torch.uint8,
+        )
+        slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int32)
+        triton_turboquant_store(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            rotation,
+            midpoints,
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+        )
+
+        block_table = torch.arange(num_blocks, device=device, dtype=torch.int32)[None]
+        seq_lens = torch.tensor([num_tokens], device=device, dtype=torch.int32)
+
+        def decode(block_kv: int, num_warps: int) -> torch.Tensor:
+            return triton_turboquant_decode_attention(
+                query=query,
+                kv_cache=kv_cache,
+                block_table=block_table,
+                seq_lens=seq_lens,
+                Pi=rotation,
+                centroids=centroids,
+                scale=1.0 / math.sqrt(head_dim),
+                mse_bits=cfg.key_mse_bits,
+                key_packed_size=cfg.key_packed_size,
+                value_quant_bits=cfg.effective_value_quant_bits,
+                key_fp8=cfg.key_fp8,
+                norm_correction=cfg.norm_correction,
+                PiT=rotation,
+                max_num_kv_splits=32,
+                stage1_block_kv=block_kv,
+                stage1_num_warps=num_warps,
+            )
+
+        reference = decode(4, 1)
+        for block_kv, num_warps in ((4, 2), (4, 4), (8, 4)):
+            torch.testing.assert_close(
+                decode(block_kv, num_warps),
+                reference,
+                rtol=5e-3,
+                atol=5e-3,
+            )

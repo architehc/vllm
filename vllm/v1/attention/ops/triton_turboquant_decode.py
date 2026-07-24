@@ -503,6 +503,8 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    stage1_block_kv: int = 4,
+    stage1_num_warps: int = 1,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -513,6 +515,15 @@ def triton_turboquant_decode_attention(
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
     device = query.device
+
+    if stage1_block_kv not in (1, 2, 4, 8, 16):
+        raise ValueError(
+            f"stage1_block_kv must be one of (1, 2, 4, 8, 16), got {stage1_block_kv}"
+        )
+    if stage1_num_warps not in (1, 2, 4, 8):
+        raise ValueError(
+            f"stage1_num_warps must be one of (1, 2, 4, 8), got {stage1_num_warps}"
+        )
 
     cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
 
@@ -549,7 +560,6 @@ def triton_turboquant_decode_attention(
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
-    BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
         q_rot,
@@ -579,11 +589,11 @@ def triton_turboquant_decode_attention(
         VAL_DATA_BYTES=cfg["val_data_bytes"],
         ATTN_SCALE=scale,
         BLOCK_D=cfg["BLOCK_D"],
-        BLOCK_KV=BLOCK_KV,
+        BLOCK_KV=stage1_block_kv,
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
-        num_warps=1,
+        num_warps=stage1_num_warps,
         num_stages=1,
     )
 
