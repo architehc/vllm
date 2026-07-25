@@ -137,6 +137,85 @@ def test_prefetch_slot_owner_is_published_only_after_enqueue():
     assert not offloader.module_offloaders[2]._prefetch_required
 
 
+def test_slot_use_is_recorded_before_lookahead_prefetch(monkeypatch):
+    log: list[str] = []
+
+    class LoggingModule(torch.nn.Module):
+        def forward(self, hidden_states):
+            log.append("forward")
+            return hidden_states
+
+    modules = [LoggingModule() for _ in range(4)]
+    offloader = object.__new__(PrefetchOffloader)
+    offloader.offload_params = set()
+    offloader.prefetch_step = 2
+    offloader._slot_owners = [0, 1]
+    offloader._slot_use_events = [object(), object()]
+    offloader._slot_use_event_valid = [False, False]
+
+    class FakeModuleOffloader:
+        def __init__(self, layer_idx: int):
+            self.module = modules[layer_idx]
+            self._buffer_slot_idx = layer_idx % 2
+            self._prefetch_required = False
+
+    class FakeCurrentStream:
+        def record_event(self, event):
+            slot_idx = offloader._slot_use_events.index(event)
+            log.append(f"record-slot:{slot_idx}")
+
+    offloader.module_offloaders = [FakeModuleOffloader(i) for i in range(4)]
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: FakeCurrentStream())
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "wait_prefetch",
+        lambda _tensor, index: log.append(f"wait:{index}"),
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "start_prefetch",
+        lambda _tensor, index: log.append(f"start:{index}"),
+    )
+    offloader._hook_module_forward(0, modules[0])
+
+    modules[0](torch.zeros(1, 2))
+
+    assert log == ["wait:0", "forward", "record-slot:0", "start:2"]
+    assert offloader._slot_use_event_valid == [True, False]
+
+
+def test_prefetch_waits_for_use_event_of_target_static_slot():
+    log: list[str] = []
+    slot_events = [object(), object()]
+    offloader = object.__new__(PrefetchOffloader)
+    offloader._slot_owners = [0, 1]
+    offloader._slot_use_events = slot_events
+    offloader._slot_use_event_valid = [True, True]
+
+    class FakeCopyStream:
+        def wait_event(self, event):
+            log.append(f"wait-slot:{slot_events.index(event)}")
+
+    class FakeModuleOffloader:
+        def __init__(self, layer_idx: int):
+            self.layer_idx = layer_idx
+            self._buffer_slot_idx = layer_idx % 2
+            self._prefetch_required = layer_idx >= 2
+
+        def start_onload_to_static(self):
+            log.append(f"enqueue:{self.layer_idx}")
+            self._prefetch_required = False
+
+    offloader.copy_stream = FakeCopyStream()
+    offloader.module_offloaders = [FakeModuleOffloader(i) for i in range(4)]
+
+    offloader._start_prefetch(3)
+
+    assert log == ["wait-slot:1", "enqueue:3"]
+    assert offloader._slot_use_event_valid == [True, False]
+    assert offloader._slot_owners == [0, 3]
+
+
 def test_partial_traversal_reprimes_stale_slot_on_next_invocation(monkeypatch):
     calls: list[tuple[str, int]] = []
     modules = [torch.nn.Identity() for _ in range(4)]
