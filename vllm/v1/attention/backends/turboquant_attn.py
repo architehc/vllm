@@ -30,6 +30,7 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
 from vllm.triton_utils import triton
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -50,6 +51,7 @@ from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
     _use_fp8_e4b15,
     triton_turboquant_decode_attention,
+    triton_turboquant_dequant_q4_nc_original_128,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
 from vllm.v1.worker.workspace import (
@@ -201,6 +203,39 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+        self._reserve_continuation_prefill_workspace()
+
+    def _reserve_continuation_prefill_workspace(self) -> None:
+        """Reserve the two final-layout K/V buffers before workspace lock."""
+        if not is_workspace_manager_initialized():
+            return
+
+        scheduler_config = self.vllm_config.scheduler_config
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        can_have_cached_prefix = bool(
+            scheduler_config.enable_chunked_prefill
+            or getattr(cache_config, "enable_prefix_caching", False)
+        )
+        if (
+            not can_have_cached_prefix
+            or scheduler_config.max_num_batched_tokens <= _CONTINUATION_DECODE_THRESHOLD
+        ):
+            return
+
+        model_config = self.vllm_config.model_config
+        # Runtime buffers include both cached and current tokens, so reserve
+        # for the full sequence length (not max_model_len - 1). Rounding the
+        # full length also covers max_model_len % block_size == 1.
+        alloc_len = round_up(model_config.max_model_len, self.kv_cache_spec.block_size)
+        buf_shape = (
+            alloc_len,
+            self.kv_cache_spec.num_kv_heads,
+            self.kv_cache_spec.head_size,
+        )
+        current_workspace_manager().get_simultaneous(
+            (buf_shape, model_config.dtype),
+            (buf_shape, model_config.dtype),
+        )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -736,80 +771,93 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
 
-        # Dequant cached K/V from TQ cache
-        # Allocate slightly over to align to block_size for the grid.
-        # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
-        alloc_len = math.ceil(cached_len / block_size) * block_size
-        buf_shape = (1, Hk, alloc_len, D)
-        # Use WorkspaceManager for dequant buffers.
-        # Shared across all layers — saves 60× memory at long context.
-        # Required for CUDA Graph capture (per-layer growth incompatible with CG).
-        k_buf, v_buf = current_workspace_manager().get_simultaneous(
-            (buf_shape, torch.float16),
-            (buf_shape, torch.float16),
-        )
-        # Skip .zero_() — kernel writes all positions up to cached_len,
-        # and we only read [:cached_len] afterwards.
-        k_cached = k_buf[:, :, :alloc_len, :]
-        v_cached = v_buf[:, :, :alloc_len, :]
-
-        grid = (alloc_len, 1 * Hk)
-        _tq_full_dequant_kv[grid](
-            kv_cache,
-            block_table,
-            centroids,
-            k_cached,
-            v_cached,
-            k_cached.stride(0),
-            k_cached.stride(1),
-            k_cached.stride(2),
-            v_cached.stride(0),
-            v_cached.stride(1),
-            v_cached.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_HEADS=Hk,
-            MSE_BYTES=mse_bytes,
-            KPS=self.tq_config.key_packed_size,
-            VQB=self.tq_config.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            MSE_BITS=self.tq_config.key_mse_bits,
-            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
-            BLOCK_D=BLOCK_D,
-            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-            num_warps=4,
-        )
-
-        # Inverse-rotate MSE keys back to original space
-        if not self.tq_config.key_fp8:
-            # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
-            Pi_half = layer._tq_Pi_half
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
-            k_flat = k_flat @ Pi_half
-            k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
-                0, 1
-            )  # (cached_len, Hk, D) — already fp16
-        else:
-            k_cached_trim = k_cached[0, :, :cached_len, :].transpose(
-                0, 1
-            )  # (cached_len, Hk, D)
-
-        # Skip .contiguous() — the copy into k_full/v_full handles layout
-        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
-
-        # Concatenate cached + current chunk K/V (match query dtype)
-        # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
+        # Q4-NC/D128 is the production Hy3 path. Dequant its cached records
+        # directly to original-space, FlashAttention-ready layout. This replaces
+        # rotated K/V staging + inverse GEMM + two full-buffer copies with just
+        # the final K/V workspace pair.
         qdtype = query.dtype
-        k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        k_full[:cached_len] = k_cached_trim.to(qdtype)
+        direct_q4_nc = (
+            D == 128
+            and not self.tq_config.key_fp8
+            and self.tq_config.key_mse_bits == 4
+            and self.tq_config.effective_value_quant_bits == 4
+            and self.tq_config.norm_correction
+            and self.tq_config.key_packed_size == 66
+        )
+        if direct_q4_nc:
+            full_shape = (seq_len, Hk, D)
+            k_full, v_full = current_workspace_manager().get_simultaneous(
+                (full_shape, qdtype),
+                (full_shape, qdtype),
+            )
+            triton_turboquant_dequant_q4_nc_original_128(
+                kv_cache=kv_cache,
+                block_table=block_table,
+                centroids=centroids,
+                cached_len=cached_len,
+                key_out=k_full,
+                value_out=v_full,
+            )
+        else:
+            # Generic fallback retains the staged inverse rotation for other
+            # TurboQuant presets and head dimensions.
+            alloc_len = math.ceil(cached_len / block_size) * block_size
+            buf_shape = (1, Hk, alloc_len, D)
+            k_buf, v_buf = current_workspace_manager().get_simultaneous(
+                (buf_shape, torch.float16),
+                (buf_shape, torch.float16),
+            )
+            k_cached = k_buf[:, :, :alloc_len, :]
+            v_cached = v_buf[:, :, :alloc_len, :]
+
+            grid = (alloc_len, Hk)
+            _tq_full_dequant_kv[grid](
+                kv_cache,
+                block_table,
+                centroids,
+                k_cached,
+                v_cached,
+                k_cached.stride(0),
+                k_cached.stride(1),
+                k_cached.stride(2),
+                v_cached.stride(0),
+                v_cached.stride(1),
+                v_cached.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                block_table.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                KPS=self.tq_config.key_packed_size,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                KEY_FP8=1 if self.tq_config.key_fp8 else 0,
+                BLOCK_D=BLOCK_D,
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+                num_warps=4,
+            )
+
+            if not self.tq_config.key_fp8:
+                Pi_half = layer._tq_Pi_half
+                k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
+                k_flat = k_flat @ Pi_half
+                k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(0, 1)
+            else:
+                k_cached_trim = k_cached[0, :, :cached_len, :].transpose(0, 1)
+            v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+
+            k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+            v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+            k_full[:cached_len] = k_cached_trim.to(qdtype)
+            v_full[:cached_len] = v_cached_trim.to(qdtype)
+
+        # Current-chunk K/V remain unquantized, matching first-chunk prefill.
         k_full[cached_len:] = key_chunk
-        v_full[:cached_len] = v_cached_trim.to(qdtype)
         v_full[cached_len:] = val_chunk
 
         # Attention: q_len queries attending to seq_len K/V with causal mask

@@ -288,6 +288,136 @@ class TestHybridAttentionIndices:
         assert _get_full_attention_layer_indices(mc) == []
 
 
+class TestTurboQuantContinuationWorkspace:
+    @staticmethod
+    def _fake_vllm_config(
+        *,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        max_tokens=4096,
+        max_model_len=8192,
+    ):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_num_batched_tokens=max_tokens,
+            ),
+            model_config=SimpleNamespace(
+                max_model_len=max_model_len,
+                dtype=torch.bfloat16,
+            ),
+            cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
+        )
+
+    @staticmethod
+    def _fake_kv_cache_spec():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(block_size=32, num_kv_heads=4, head_size=128)
+
+    def test_reserves_only_final_layout_kv_pair(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from vllm.v1.attention.backends import turboquant_attn
+
+        calls = []
+
+        class FakeWorkspaceManager:
+            def get_simultaneous(self, *shapes_and_dtypes):
+                calls.append(shapes_and_dtypes)
+
+        monkeypatch.setattr(
+            turboquant_attn, "is_workspace_manager_initialized", lambda: True
+        )
+        monkeypatch.setattr(
+            turboquant_attn,
+            "current_workspace_manager",
+            lambda: FakeWorkspaceManager(),
+        )
+
+        builder = SimpleNamespace(
+            vllm_config=self._fake_vllm_config(),
+            kv_cache_spec=self._fake_kv_cache_spec(),
+        )
+        turboquant_attn.TurboQuantMetadataBuilder._reserve_continuation_prefill_workspace(
+            builder
+        )
+
+        expected = ((8192, 4, 128), torch.bfloat16)
+        assert calls == [(expected, expected)]
+
+    def test_reservation_rounds_up_full_model_length_for_prefix_cache(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from vllm.v1.attention.backends import turboquant_attn
+
+        calls = []
+
+        class FakeWorkspaceManager:
+            def get_simultaneous(self, *shapes_and_dtypes):
+                calls.append(shapes_and_dtypes)
+
+        monkeypatch.setattr(
+            turboquant_attn, "is_workspace_manager_initialized", lambda: True
+        )
+        monkeypatch.setattr(
+            turboquant_attn,
+            "current_workspace_manager",
+            lambda: FakeWorkspaceManager(),
+        )
+        builder = SimpleNamespace(
+            vllm_config=self._fake_vllm_config(
+                enable_chunked_prefill=False,
+                enable_prefix_caching=True,
+                max_model_len=8193,
+            ),
+            kv_cache_spec=self._fake_kv_cache_spec(),
+        )
+        turboquant_attn.TurboQuantMetadataBuilder._reserve_continuation_prefill_workspace(
+            builder
+        )
+
+        expected = ((8224, 4, 128), torch.bfloat16)
+        assert calls == [(expected, expected)]
+
+    @pytest.mark.parametrize(
+        ("enable_chunked_prefill", "max_tokens"),
+        [(False, 4096), (True, 128)],
+    )
+    def test_skips_reservation_without_large_continuations(
+        self, monkeypatch, enable_chunked_prefill, max_tokens
+    ):
+        from types import SimpleNamespace
+
+        from vllm.v1.attention.backends import turboquant_attn
+
+        calls = []
+        monkeypatch.setattr(
+            turboquant_attn, "is_workspace_manager_initialized", lambda: True
+        )
+        monkeypatch.setattr(
+            turboquant_attn,
+            "current_workspace_manager",
+            lambda: calls.append(True),
+        )
+
+        builder = SimpleNamespace(
+            vllm_config=self._fake_vllm_config(
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_tokens=max_tokens,
+            ),
+            kv_cache_spec=self._fake_kv_cache_spec(),
+        )
+        turboquant_attn.TurboQuantMetadataBuilder._reserve_continuation_prefill_workspace(
+            builder
+        )
+        assert calls == []
+
+
 # ============================================================================
 # Centroids tests (CPU-only)
 # ============================================================================
@@ -525,6 +655,142 @@ class TestHadamardRotation:
 @pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
 class TestStoreDecodeRoundTrip:
     """End-to-end: store KV into TQ cache, decode, compare vs fp16 ref."""
+
+    @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+    def test_q4_nc_direct_original_dequant_matches_staged_path(self, output_dtype):
+        """Fused inverse-FWHT preserves the established Q4-NC reconstruction."""
+        from vllm.model_executor.layers.quantization.turboquant.centroids import (
+            solve_lloyd_max,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            _tq_full_dequant_kv,
+            triton_turboquant_dequant_q4_nc_original_128,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_store import (
+            triton_turboquant_store,
+        )
+
+        cfg = TurboQuantConfig.from_cache_dtype("turboquant_4bit_nc", head_dim=128)
+        device = torch.device(DEVICE_TYPE)
+        cached_len, seq_len, num_kv_heads, head_dim = 65, 81, 4, 128
+        block_size = 16
+        num_blocks = math.ceil(seq_len / block_size)
+
+        rotation = _build_hadamard(head_dim, DEVICE_TYPE)
+        centroids, _ = solve_lloyd_max(head_dim, cfg.centroid_bits)
+        centroids = centroids.float().to(device)
+        sorted_centroids, _ = centroids.sort()
+        midpoints = (sorted_centroids[:-1] + sorted_centroids[1:]) / 2
+
+        torch.manual_seed(20260724)
+        key = torch.randn(
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float16,
+        )
+        value = torch.randn_like(key)
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            cfg.slot_size_aligned,
+            device=device,
+            dtype=torch.uint8,
+        )
+        slot_mapping = torch.arange(seq_len, device=device, dtype=torch.int32)
+        triton_turboquant_store(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            rotation,
+            midpoints,
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+        )
+        block_table = torch.arange(num_blocks, device=device, dtype=torch.int32)[None]
+
+        # Established staged path: transformed-domain fp16 dequant followed by
+        # a dense fp16 inverse-Hadamard GEMM and final model-dtype conversion.
+        alloc_len = math.ceil(cached_len / block_size) * block_size
+        key_hadamard = torch.empty(
+            1,
+            num_kv_heads,
+            alloc_len,
+            head_dim,
+            device=device,
+            dtype=torch.float16,
+        )
+        value_staged = torch.empty_like(key_hadamard)
+        _tq_full_dequant_kv[(alloc_len, num_kv_heads)](
+            kv_cache,
+            block_table,
+            centroids,
+            key_hadamard,
+            value_staged,
+            key_hadamard.stride(0),
+            key_hadamard.stride(1),
+            key_hadamard.stride(2),
+            value_staged.stride(0),
+            value_staged.stride(1),
+            value_staged.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            HEAD_DIM=head_dim,
+            BLOCK_SIZE=block_size,
+            NUM_KV_HEADS=num_kv_heads,
+            MSE_BYTES=64,
+            KPS=cfg.key_packed_size,
+            VQB=cfg.effective_value_quant_bits,
+            VAL_DATA_BYTES=64,
+            MSE_BITS=cfg.key_mse_bits,
+            KEY_FP8=0,
+            BLOCK_D=128,
+            NORM_CORRECTION=1,
+            FP8_E4B15=0,
+            num_warps=4,
+        )
+        key_reference = (
+            key_hadamard[0, :, :cached_len]
+            .reshape(-1, head_dim)
+            .matmul(rotation.to(torch.float16))
+            .reshape(num_kv_heads, cached_len, head_dim)
+            .transpose(0, 1)
+            .to(output_dtype)
+        )
+        value_reference = (
+            value_staged[0, :, :cached_len].transpose(0, 1).to(output_dtype)
+        )
+
+        key_direct = torch.empty(
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=output_dtype,
+        )
+        value_direct = torch.empty_like(key_direct)
+        triton_turboquant_dequant_q4_nc_original_128(
+            kv_cache,
+            block_table,
+            centroids,
+            cached_len,
+            key_direct,
+            value_direct,
+        )
+
+        torch.testing.assert_close(
+            key_direct[:cached_len], key_reference, rtol=2e-3, atol=2e-3
+        )
+        torch.testing.assert_close(
+            value_direct[:cached_len], value_reference, rtol=0, atol=0
+        )
 
     @pytest.mark.parametrize(
         "preset",

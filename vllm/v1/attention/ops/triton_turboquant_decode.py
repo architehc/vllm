@@ -456,6 +456,189 @@ def _tq_full_dequant_kv(
 
 
 # ---------------------------------------------------------------------------
+# Hy3 Q4-NC continuation prefill: direct original-layout dequant
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fwht_stage(
+    x,
+    NUM_GROUPS: tl.constexpr,
+    HALF_GROUP_SIZE: tl.constexpr,
+):
+    """One register-only Sylvester FWHT stage."""
+    grouped = tl.reshape(x, (NUM_GROUPS, 2, HALF_GROUP_SIZE))
+    # tl.split operates on the last dimension, so temporarily move the
+    # butterfly pair there.
+    grouped = tl.permute(grouped, (0, 2, 1))
+    lo, hi = tl.split(grouped)
+    grouped = tl.join(lo + hi, lo - hi)
+    grouped = tl.permute(grouped, (0, 2, 1))
+    return tl.reshape(grouped, (NUM_GROUPS * 2 * HALF_GROUP_SIZE,))
+
+
+@triton.jit
+def _fwht_128(x):
+    """Unnormalized 128-point Sylvester FWHT in registers."""
+    x = _fwht_stage(x, NUM_GROUPS=64, HALF_GROUP_SIZE=1)
+    x = _fwht_stage(x, NUM_GROUPS=32, HALF_GROUP_SIZE=2)
+    x = _fwht_stage(x, NUM_GROUPS=16, HALF_GROUP_SIZE=4)
+    x = _fwht_stage(x, NUM_GROUPS=8, HALF_GROUP_SIZE=8)
+    x = _fwht_stage(x, NUM_GROUPS=4, HALF_GROUP_SIZE=16)
+    x = _fwht_stage(x, NUM_GROUPS=2, HALF_GROUP_SIZE=32)
+    return _fwht_stage(x, NUM_GROUPS=1, HALF_GROUP_SIZE=64)
+
+
+@triton.jit
+def _tq_dequant_q4_nc_original_128(
+    KV_cache_ptr,
+    Block_table_ptr,
+    Centroids_ptr,
+    K_out_ptr,  # [max_seq, Hk, 128], fp16/bf16
+    V_out_ptr,  # [max_seq, Hk, 128], fp16/bf16
+    stride_ko_s,
+    stride_ko_h,
+    stride_vo_s,
+    stride_vo_h,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_head,
+    BLOCK_SIZE: tl.constexpr,
+    KPS: tl.constexpr,
+    H_SCALE_FP16: tl.constexpr,
+):
+    """Dequant Q4-NC K/V directly into FlashAttention's original layout.
+
+    The stored key is a centroid vector in the Hadamard domain.  Because the
+    128-point Sylvester Hadamard matrix is symmetric and orthonormal, its
+    inverse is the same FWHT.  Applying it here removes both the context-sized
+    rotated-key staging tensor and the dense inverse-rotation GEMM.
+
+    The fp16 casts deliberately match the former staged implementation's
+    rounding points: reconstructed Hadamard-domain keys and the inverse-GEMM
+    result were both fp16 before being copied to the model dtype.
+    """
+    pos = tl.program_id(0)
+    hid = tl.program_id(1)
+
+    page_idx = pos // BLOCK_SIZE
+    page_off = pos % BLOCK_SIZE
+    block_num = tl.load(Block_table_ptr + page_idx).to(tl.int64)
+    slot_base = (
+        block_num * stride_cache_block
+        + tl.cast(page_off, tl.int64) * stride_cache_pos
+        + tl.cast(hid, tl.int64) * stride_cache_head
+    )
+
+    d_offs = tl.arange(0, 128)
+
+    # Q4 centroid indices: two nibbles per byte.
+    packed = tl.load(KV_cache_ptr + slot_base + d_offs // 2).to(tl.int32)
+    centroid_idx = (packed >> ((d_offs & 1) * 4)) & 0xF
+    centroid_values = tl.load(Centroids_ptr + centroid_idx).to(tl.float32)
+
+    # Q4-NC re-normalizes the centroid vector before restoring the saved norm.
+    centroid_norm_sq = tl.sum(centroid_values * centroid_values, axis=0)
+    centroid_values *= 1.0 / tl.sqrt(centroid_norm_sq + 1e-16)
+
+    # The two-byte fp16 norm immediately follows the 64 Q4 data bytes.
+    norm_base = slot_base + 64
+    norm_lo = tl.load(KV_cache_ptr + norm_base).to(tl.uint16)
+    norm_hi = tl.load(KV_cache_ptr + norm_base + 1).to(tl.uint16)
+    vec_norm = (norm_lo | (norm_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+
+    # Reproduce the old fp16 dequant staging, then perform H^T == H with a
+    # register-only FWHT.  H_SCALE_FP16 is the exact fp16 value previously
+    # stored in layer._tq_Pi_half (1/sqrt(128), rounded to fp16).
+    k_hadamard = (vec_norm * centroid_values).to(tl.float16).to(tl.float32)
+    k_original = _fwht_128(k_hadamard * H_SCALE_FP16)
+    ko_base = pos * stride_ko_s + hid * stride_ko_h
+    tl.store(K_out_ptr + ko_base + d_offs, k_original.to(tl.float16))
+
+    # Q4 value dequantization, directly into final [seq, Hk, D] layout.
+    val_base = slot_base + KPS
+    value_packed = tl.load(KV_cache_ptr + val_base + d_offs // 2).to(tl.int32)
+    value_idx = ((value_packed >> ((d_offs & 1) * 4)) & 0xF).to(tl.float32)
+
+    scale_base = val_base + 64
+    scale_lo = tl.load(KV_cache_ptr + scale_base).to(tl.uint16)
+    scale_hi = tl.load(KV_cache_ptr + scale_base + 1).to(tl.uint16)
+    value_scale = (
+        (scale_lo | (scale_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    )
+    zero_lo = tl.load(KV_cache_ptr + scale_base + 2).to(tl.uint16)
+    zero_hi = tl.load(KV_cache_ptr + scale_base + 3).to(tl.uint16)
+    value_zero = (zero_lo | (zero_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    value_original = value_idx * value_scale + value_zero
+    vo_base = pos * stride_vo_s + hid * stride_vo_h
+    tl.store(V_out_ptr + vo_base + d_offs, value_original.to(tl.float16))
+
+
+def triton_turboquant_dequant_q4_nc_original_128(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    centroids: torch.Tensor,
+    cached_len: int,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+) -> None:
+    """Dequant cached Hy3 Q4-NC records directly to original-space K/V."""
+    if cached_len < 0 or cached_len > key_out.shape[0]:
+        raise ValueError(
+            f"cached_len must be in [0, {key_out.shape[0]}], got {cached_len}"
+        )
+    if cached_len > value_out.shape[0]:
+        raise ValueError("value_out is shorter than cached_len")
+    if key_out.shape[1:] != value_out.shape[1:]:
+        raise ValueError("key_out and value_out must have matching head shapes")
+    if key_out.shape[2] != 128:
+        raise ValueError("direct Q4-NC dequant is specialized for head_dim=128")
+    if key_out.stride(2) != 1 or value_out.stride(2) != 1:
+        raise ValueError("key_out and value_out must be contiguous in head_dim")
+    if key_out.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("key_out must be fp16 or bf16")
+    if value_out.dtype != key_out.dtype:
+        raise ValueError("key_out and value_out must have the same dtype")
+    if key_out.device != kv_cache.device or value_out.device != kv_cache.device:
+        raise ValueError("KV cache and output tensors must be on the same device")
+    if kv_cache.dtype != torch.uint8 or kv_cache.ndim != 4:
+        raise ValueError("Q4-NC KV cache must be a rank-4 uint8 tensor")
+    if kv_cache.shape[2] != key_out.shape[1] or kv_cache.shape[3] < 134:
+        raise ValueError("Q4-NC KV cache shape does not match output heads/layout")
+    if block_table.ndim != 2 or block_table.shape[0] < 1:
+        raise ValueError("block_table must contain at least one request row")
+    if centroids.numel() != 16:
+        raise ValueError("Q4-NC dequant requires exactly 16 centroids")
+    if cached_len == 0:
+        return
+
+    num_kv_heads = key_out.shape[1]
+    block_size = kv_cache.shape[1]
+    # torch.float16(1/sqrt(128)) == 0.08837890625.  Passing the rounded
+    # value preserves the multiplication performed by the former fp16 GEMM.
+    h_scale_fp16 = 0.08837890625
+    _tq_dequant_q4_nc_original_128[(cached_len, num_kv_heads)](
+        kv_cache,
+        block_table,
+        centroids,
+        key_out,
+        value_out,
+        key_out.stride(0),
+        key_out.stride(1),
+        value_out.stride(0),
+        value_out.stride(1),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        BLOCK_SIZE=block_size,
+        KPS=66,
+        H_SCALE_FP16=h_scale_fp16,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stage 2: Reuse from triton_decode_attention.py
 # ---------------------------------------------------------------------------
 
