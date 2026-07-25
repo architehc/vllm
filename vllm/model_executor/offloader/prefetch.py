@@ -262,12 +262,6 @@ class PrefetchOffloader(BaseOffloader):
         # overwrite the same slot before an interrupted traversal reaches the
         # circular tail that normally re-primes the first modules.
         self._slot_owners: list[int | None] = []
-        # A static slot can be overwritten only after the compute stream has
-        # finished the forward that consumed it. These persistent events are
-        # recorded on the stream that actually ran the forward, then joined by
-        # copy_stream before it enqueues the next H2D into that slot.
-        self._slot_use_events: list[torch.cuda.Event] = []
-        self._slot_use_event_valid: list[bool] = []
         self.total_offloaded_bytes = 0
 
     def wrap_modules(
@@ -363,11 +357,6 @@ class PrefetchOffloader(BaseOffloader):
             # GPU static buffers (set in assign_static_buffer)
             output = original_forward(*args, **kwargs)
 
-            if not bypass_current:
-                # original_forward only enqueues GPU work. Record its actual
-                # stream use before the lookahead copy can overwrite this slot.
-                self._record_slot_use(index)
-
             # Start prefetch for next layer (circular)
             # mutates_args on output_tensor creates ordering dependency
             next_index = (index + self.prefetch_step) % len(self.module_offloaders)
@@ -448,17 +437,6 @@ class PrefetchOffloader(BaseOffloader):
         slot_idx: int | None = None
         if slot_owners:
             slot_idx = offloader._buffer_slot_idx % len(slot_owners)
-            slot_use_events = getattr(self, "_slot_use_events", None)
-            slot_use_event_valid = getattr(self, "_slot_use_event_valid", None)
-            if (
-                slot_use_events
-                and slot_use_event_valid
-                and slot_use_event_valid[slot_idx]
-            ):
-                # The prior forward is asynchronous. Serialize this slot's H2D
-                # overwrite behind the precise stream that consumed it.
-                self.copy_stream.wait_event(slot_use_events[slot_idx])
-                slot_use_event_valid[slot_idx] = False
             prior_owner = slot_owners[slot_idx]
             # Invalidate the old owner before any overwrite can be enqueued.
             # Clear the owner while the copy is being prepared so a failed
@@ -474,18 +452,6 @@ class PrefetchOffloader(BaseOffloader):
         # event have been enqueued. Publish ownership no earlier than that.
         if slot_idx is not None:
             slot_owners[slot_idx] = layer_idx
-
-    def _record_slot_use(self, layer_idx: int) -> None:
-        """Fence the last compute use of a shared static-buffer slot."""
-        slot_use_events = getattr(self, "_slot_use_events", None)
-        slot_use_event_valid = getattr(self, "_slot_use_event_valid", None)
-        if not slot_use_events or not slot_use_event_valid:
-            # Hooks are installed before post_init creates the slot events.
-            return
-        offloader = self.module_offloaders[layer_idx]
-        slot_idx = offloader._buffer_slot_idx % len(slot_use_events)
-        torch.cuda.current_stream().record_event(slot_use_events[slot_idx])
-        slot_use_event_valid[slot_idx] = True
 
     def _owns_static_slot(self, layer_idx: int) -> bool:
         """Return whether the shared GPU slot currently contains this layer."""
@@ -582,8 +548,6 @@ class PrefetchOffloader(BaseOffloader):
         # Ownership starts empty and is published by the initial prefetches
         # only after their H2D copies have been enqueued.
         self._slot_owners = [None] * self.prefetch_step
-        self._slot_use_events = [torch.cuda.Event() for _ in range(self.prefetch_step)]
-        self._slot_use_event_valid = [False] * self.prefetch_step
 
         # Collect offloaded bytes
         for offloader in self.module_offloaders:
